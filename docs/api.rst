@@ -21,6 +21,10 @@ Plainly then, you may rely on their methods and attributes not changing in backw
    :members:
    :undoc-members:
 
+.. autoclass:: referencing._core.TracedResolved
+   :members:
+   :undoc-members:
+
 
 .. autoclass:: referencing._core.Retrieved
    :members:
@@ -63,6 +67,14 @@ referencing.exceptions
 .. automodule:: referencing.exceptions
    :members:
    :show-inheritance:
+   :undoc-members:
+
+
+referencing.trace
+^^^^^^^^^^^^^^^^^
+
+.. automodule:: referencing.trace
+   :members:
    :undoc-members:
 
 

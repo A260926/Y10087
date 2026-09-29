@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from enum import Enum
-from typing import Any, ClassVar, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 from urllib.parse import unquote, urldefrag, urljoin
 
 from attrs import evolve, field
 from rpds import HashTrieMap, HashTrieSet, List
 
-from referencing import exceptions
+from referencing import _trace, exceptions
 from referencing._attrs import frozen
 from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
+
+if TYPE_CHECKING:
+    from referencing._trace import Trace
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
@@ -262,7 +265,8 @@ class Resource(Generic[D]):
 
         contents = self.contents
         segments: list[int | str] = []
-        for segment in unquote(pointer[1:]).split("/"):
+        for raw_segment in unquote(pointer[1:]).split("/"):
+            segment = raw_segment
             if isinstance(contents, Sequence):
                 segment = int(segment)
             else:
@@ -270,6 +274,14 @@ class Resource(Generic[D]):
             try:
                 contents = contents[segment]  # type: ignore[reportUnknownArgumentType]
             except LookupError as lookup_error:
+                _trace.record(
+                    _trace.Action.pointer,
+                    input_uri=pointer,
+                    uri=resolver._base_uri,  # type: ignore[reportPrivateUsage]
+                    raw_segment=raw_segment,
+                    decoded_segment=segment,
+                    found=False,
+                )
                 error = exceptions.PointerToNowhere(ref=pointer, resource=self)
                 raise error from lookup_error
 
@@ -282,11 +294,30 @@ class Resource(Generic[D]):
             )
             if resolver is not last:
                 segments = []
+            _trace.record(
+                _trace.Action.pointer,
+                input_uri=pointer,
+                uri=resolver._base_uri,  # type: ignore[reportPrivateUsage]
+                raw_segment=raw_segment,
+                decoded_segment=segment,
+            )
         return Resolved(contents=contents, resolver=resolver)  # type: ignore[reportUnknownArgumentType]
 
 
 def _fail_to_retrieve(uri: URI):
     raise exceptions.NoSuchResource(ref=uri)
+
+
+def _attach_trace(error: BaseException) -> None:
+    """
+    Attach the active trace (if any) to a public exception, in place.
+
+    Does nothing for untraced lookups or for errors which already carry a
+    trace (e.g. one attached deeper in a nested lookup).
+    """
+    trace = _trace.collect()
+    if trace is not None and getattr(error, "trace", None) is None:
+        object.__setattr__(error, "_trace", trace)
 
 
 @frozen
@@ -412,21 +443,48 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resource = self._resources.get(uri)
         if resource is not None:
+            _trace.record(_trace.Action.hit, uri=uri, target=uri)
             return Retrieved(registry=self, value=resource)
 
         registry = self.crawl()
         resource = registry._resources.get(uri)
         if resource is not None:
+            _trace.record(
+                _trace.Action.crawl_hit,
+                uri=uri,
+                target=uri,
+            )
             return Retrieved(registry=registry, value=resource)
 
         try:
+            _trace.record(
+                _trace.Action.retrieve,
+                uri=uri,
+                target=uri,
+                retrieved=True,
+            )
             resource = registry._retrieve(uri)
         except (
             exceptions.CannotDetermineSpecification,
             exceptions.NoSuchResource,
-        ):
+        ) as error:
+            _trace.record(
+                _trace.Action.retrieve_failed,
+                uri=uri,
+                target=uri,
+                retrieved=True,
+                found=False,
+            )
+            _attach_trace(error)
             raise
         except Exception as error:
+            _trace.record(
+                _trace.Action.retrieve_failed,
+                uri=uri,
+                target=uri,
+                retrieved=True,
+                found=False,
+            )
             raise exceptions.Unretrievable(ref=uri) from error
         else:
             registry = registry.with_resource(uri, resource)
@@ -452,13 +510,35 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         Retrieve a given anchor from a resource which must already be crawled.
         """
+        return self._anchor(uri, name, emit_anchor=True)
+
+    def _anchor(self, uri: URI, name: str, emit_anchor: bool):
+        """
+        Internal anchor lookup, optionally recording an anchor trace event.
+
+        Dynamic-anchor resolution repeatedly probes registries along the
+        dynamic scope; those probes must be traced individually (by the
+        caller) without each one emitting a redundant anchor event.
+        """
         value = self._anchors.get((uri, name))
         if value is not None:
+            if emit_anchor:
+                _trace.record(
+                    _trace.Action.anchor,
+                    uri=uri,
+                    target=f"{uri.rstrip('#')}#{name}",
+                )
             return Retrieved(value=value, registry=self)
 
         registry = self.crawl()
         value = registry._anchors.get((uri, name))
         if value is not None:
+            if emit_anchor:
+                _trace.record(
+                    _trace.Action.anchor,
+                    uri=uri,
+                    target=f"{uri.rstrip('#')}#{name}",
+                )
             return Retrieved(value=value, registry=registry)
 
         resource = self[uri]
@@ -466,15 +546,45 @@ class Registry(Mapping[URI, Resource[D]]):
         if canonical_uri is not None:
             value = registry._anchors.get((canonical_uri, name))
             if value is not None:
+                if emit_anchor:
+                    _trace.record(
+                        _trace.Action.anchor,
+                        uri=uri,
+                        target=f"{canonical_uri.rstrip('#')}#{name}",
+                    )
                 return Retrieved(value=value, registry=registry)
 
         if "/" in name:
-            raise exceptions.InvalidAnchor(
+            if emit_anchor:
+                _trace.record(
+                    _trace.Action.anchor,
+                    uri=uri,
+                    target=f"{uri.rstrip('#')}#{name}",
+                    found=False,
+                )
+            error = exceptions.InvalidAnchor(
                 ref=uri,
                 resource=resource,
                 anchor=name,
             )
-        raise exceptions.NoSuchAnchor(ref=uri, resource=resource, anchor=name)
+            if emit_anchor:
+                _attach_trace(error)
+            raise error
+        if emit_anchor:
+            _trace.record(
+                _trace.Action.anchor,
+                uri=uri,
+                target=f"{uri.rstrip('#')}#{name}",
+                found=False,
+            )
+        error = exceptions.NoSuchAnchor(
+            ref=uri,
+            resource=resource,
+            anchor=name,
+        )
+        if emit_anchor:
+            _attach_trace(error)
+        raise error
 
     def contents(self, uri: URI) -> D:
         """
@@ -489,6 +599,12 @@ class Registry(Mapping[URI, Resource[D]]):
         resources = self._resources
         anchors = self._anchors
         uncrawled = [(uri, resources[uri]) for uri in self._uncrawled]
+        if uncrawled:
+            _trace.record(
+                _trace.Action.crawl,
+                uri=uncrawled[-1][0],
+                target=uncrawled[-1][0],
+            )
         while uncrawled:
             uri, resource = uncrawled.pop()
 
@@ -619,6 +735,26 @@ class Resolved(Generic[D]):
 
 
 @frozen
+class TracedResolved(Generic[D]):
+    """
+    A `Resolved` value together with the immutable `Trace` taken to reach it.
+
+    Produced only by `Resolver.lookup_traced`.
+    """
+
+    contents: D
+    resolver: Resolver[D]
+    trace: Trace
+
+    @property
+    def resolved(self) -> Resolved[D]:
+        """
+        Return the plain `Resolved` result of the lookup.
+        """
+        return Resolved(contents=self.contents, resolver=self.resolver)
+
+
+@frozen
 class Resolver(Generic[D]):
     """
     A reference resolver.
@@ -669,16 +805,69 @@ class Resolver(Generic[D]):
                 that does not exist
 
         """
+        return self._lookup(ref)
+
+    def lookup_traced(self, ref: URI) -> TracedResolved[D]:
+        """
+        Resolve the given reference, additionally returning a verifiable trace.
+
+        This is the opt-in counterpart of `lookup`. It performs exactly one
+        resolution (no re-walking for recording), and returns a
+        `TracedResolved` containing the same `Resolved` result alongside an
+        immutable `referencing.trace.Trace` describing every step taken:
+
+        * URI combination (reference against the base URI),
+        * registry crawling,
+        * in-memory hits vs. calls to the retrieve callable,
+        * JSON Pointer segments (with raw and decoded forms),
+        * base URI changes when entering subresources,
+        * plain and dynamic anchors, in dynamic-scope order.
+
+        The trace contains only identifiers (URIs and names), never schema
+        contents or mutable registry internals. Each external resource is
+        retrieved at most once.
+
+        On failure the same exception types as `lookup` are raised (with the
+        same ``__cause__``), and the trace recorded up to the failure point is
+        available on the exception's ``trace`` attribute.
+        """
+        token = _trace.begin()
+        try:
+            resolved = self._lookup(ref)
+            result = TracedResolved(
+                contents=resolved.contents,
+                resolver=resolved.resolver,
+                trace=_trace.required(),
+            )
+        except Exception as error:
+            _attach_trace(error)
+            raise
+        finally:
+            _trace.end(token)
+        return result
+
+    def _lookup(self, ref: URI) -> Resolved[D]:
         if ref.startswith("#"):
             uri, fragment = self._base_uri, ref[1:]
         else:
             uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+        _trace.record(
+            _trace.Action.resolve,
+            input_uri=ref,
+            uri=uri + (("#" + fragment) if fragment else ""),
+            target=uri,
+        )
         try:
             retrieved = self._registry.get_or_retrieve(uri)
         except exceptions.NoSuchResource:
-            raise exceptions.Unresolvable(ref=ref) from None
+            error = exceptions.Unresolvable(ref=ref)
+            _attach_trace(error)
+            raise error from None
         except exceptions.Unretrievable as error:
-            raise exceptions.Unresolvable(ref=ref) from error
+            _attach_trace(error)
+            unresolvable = exceptions.Unresolvable(ref=ref)
+            _attach_trace(unresolvable)
+            raise unresolvable from error
 
         if fragment.startswith("/"):
             resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
@@ -699,7 +888,15 @@ class Resolver(Generic[D]):
         id = subresource.id()
         if id is None:
             return self
-        return evolve(self, base_uri=urljoin(self._base_uri, id))
+        base_uri = urljoin(self._base_uri, id)
+        if base_uri != self._base_uri:
+            _trace.record(
+                _trace.Action.subresource,
+                input_uri=self._base_uri,
+                uri=base_uri,
+                target=base_uri,
+            )
+        return evolve(self, base_uri=base_uri)
 
     def dynamic_scope(self) -> Iterable[tuple[URI, Registry[D]]]:
         """

@@ -7,7 +7,14 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence, Set
 from typing import Any
 
-from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing import (
+    Anchor,
+    Registry,
+    Resource,
+    Specification,
+    _trace,
+    exceptions,
+)
 from referencing._attrs import frozen
 from referencing._core import (
     _UNSET,  # type: ignore[reportPrivateUsage]
@@ -608,10 +615,30 @@ class DynamicAnchor:
         last = self.resource
         for uri, registry in resolver.dynamic_scope():
             try:
-                anchor = registry.anchor(uri, self.name).value
+                anchor = registry._anchor(  # type: ignore[reportPrivateUsage]
+                    uri,
+                    self.name,
+                    emit_anchor=False,
+                ).value
             except exceptions.NoSuchAnchor:
+                _trace.record(
+                    _trace.Action.dynamic_scope,
+                    input_uri=resolver._base_uri,  # type: ignore[reportPrivateUsage]
+                    uri=uri,
+                    target=f"{uri.rstrip('#')}#{self.name}",
+                    found=False,
+                )
                 continue
-            if isinstance(anchor, DynamicAnchor):
+            is_dynamic = isinstance(anchor, DynamicAnchor)
+            _trace.record(
+                _trace.Action.dynamic_scope,
+                input_uri=resolver._base_uri,  # type: ignore[reportPrivateUsage]
+                uri=uri,
+                target=f"{uri.rstrip('#')}#{self.name}",
+                found=True,
+                dynamic=is_dynamic,
+            )
+            if is_dynamic:
                 last = anchor.resource
         return _Resolved(
             contents=last.contents,

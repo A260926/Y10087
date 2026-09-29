@@ -2,6 +2,16 @@
 Changelog
 =========
 
+vNext
+-----
+
+* Add an opt-in ``Resolver.lookup_traced`` method, which returns the normal
+  ``Resolved`` result alongside an immutable trace of every resolution step
+  (URI combination, crawling, retrieval, JSON Pointer, anchors and dynamic
+  scope).
+  A normal ``Resolver.lookup`` is unchanged, and on failure the partial trace
+  is available on the raised exception's ``trace`` attribute.
+
 v0.37.0
 -------
 

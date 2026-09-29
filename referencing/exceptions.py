@@ -15,6 +15,23 @@ if TYPE_CHECKING:
     from referencing.typing import URI
 
 
+class _TraceCarrier:
+    """
+    Support attaching an opt-in resolution trace to a public exception.
+
+    The trace is not part of the exception's identity (it is not a field),
+    so equality, hashing and the exception's arguments are unchanged. It is
+    stored in a per-instance attribute populated only by a traced lookup.
+    """
+
+    @property
+    def trace(self):
+        """
+        The `referencing.trace.Trace` recorded up to the failure, if any.
+        """
+        return self.__dict__.get("_trace")
+
+
 @frozen
 class NoSuchResource(KeyError):
     """
@@ -75,7 +92,7 @@ class Unretrievable(KeyError):
 
 
 @frozen
-class CannotDetermineSpecification(Exception):
+class CannotDetermineSpecification(_TraceCarrier, Exception):
     """
     Attempting to detect the appropriate `Specification` failed.
 
@@ -95,7 +112,7 @@ class CannotDetermineSpecification(Exception):
 
 
 @attrs.frozen  # Because here we allow subclassing below.
-class Unresolvable(Exception):
+class Unresolvable(_TraceCarrier, Exception):
     """
     A reference was unresolvable.
     """
