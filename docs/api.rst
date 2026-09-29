@@ -77,6 +77,14 @@ referencing.retrieval
 .. autoclass:: referencing.retrieval._T
 
 
+referencing.tracing
+^^^^^^^^^^^^^^^^^^^
+
+.. automodule:: referencing.tracing
+   :members:
+   :undoc-members:
+
+
 referencing.typing
 ^^^^^^^^^^^^^^^^^^
 

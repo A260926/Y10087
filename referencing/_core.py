@@ -8,7 +8,7 @@ from urllib.parse import unquote, urldefrag, urljoin
 from attrs import evolve, field
 from rpds import HashTrieMap, HashTrieSet, List
 
-from referencing import exceptions
+from referencing import exceptions, tracing
 from referencing._attrs import frozen
 from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
 
@@ -263,6 +263,7 @@ class Resource(Generic[D]):
         contents = self.contents
         segments: list[int | str] = []
         for segment in unquote(pointer[1:]).split("/"):
+            raw = segment
             if isinstance(contents, Sequence):
                 segment = int(segment)
             else:
@@ -270,9 +271,24 @@ class Resource(Generic[D]):
             try:
                 contents = contents[segment]  # type: ignore[reportUnknownArgumentType]
             except LookupError as lookup_error:
+                tracing.record(
+                    tracing.Action.POINTER,
+                    uri=pointer,
+                    normalized_uri=pointer,
+                    segment=raw,
+                    decoded=segment,
+                )
                 error = exceptions.PointerToNowhere(ref=pointer, resource=self)
                 raise error from lookup_error
 
+            tracing.record(
+                tracing.Action.POINTER,
+                uri=pointer,
+                normalized_uri=pointer,
+                hit=str(segment),
+                segment=raw,
+                decoded=segment,
+            )
             segments.append(segment)
             last = resolver
             resolver = self._specification.maybe_in_subresource(
@@ -412,24 +428,53 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resource = self._resources.get(uri)
         if resource is not None:
+            tracing.record(
+                tracing.Action.HIT,
+                uri=uri,
+                normalized_uri=uri,
+                hit=uri,
+            )
             return Retrieved(registry=self, value=resource)
 
         registry = self.crawl()
         resource = registry._resources.get(uri)
         if resource is not None:
+            tracing.record(
+                tracing.Action.CRAWL,
+                uri=uri,
+                normalized_uri=uri,
+                hit=uri,
+            )
             return Retrieved(registry=registry, value=resource)
 
+        tracing.record(tracing.Action.CRAWL, uri=uri, normalized_uri=uri)
         try:
             resource = registry._retrieve(uri)
-        except (
-            exceptions.CannotDetermineSpecification,
-            exceptions.NoSuchResource,
-        ):
-            raise
         except Exception as error:
+            tracing.record(
+                tracing.Action.RETRIEVE,
+                uri=uri,
+                normalized_uri=uri,
+                retrieved=True,
+            )
+            if isinstance(
+                error,
+                (
+                    exceptions.CannotDetermineSpecification,
+                    exceptions.NoSuchResource,
+                ),
+            ):
+                raise
             raise exceptions.Unretrievable(ref=uri) from error
         else:
             registry = registry.with_resource(uri, resource)
+            tracing.record(
+                tracing.Action.RETRIEVE,
+                uri=uri,
+                normalized_uri=uri,
+                hit=uri,
+                retrieved=True,
+            )
             return Retrieved(registry=registry, value=resource)
 
     def remove(self, uri: URI):
@@ -669,10 +714,41 @@ class Resolver(Generic[D]):
                 that does not exist
 
         """
+        return self._lookup(ref)
+
+    def lookup_traced(self, ref: URI) -> tracing.Traced[D]:
+        """
+        Resolve the given reference, returning a trace of how it resolved.
+
+        This behaves exactly like `Resolver.lookup` -- including raising the
+        same exceptions -- but additionally returns an immutable
+        `referencing.tracing.Trace` describing each step taken to reach the
+        result.
+
+        If resolution fails, the raised exception is unchanged (including
+        its type and cause chain), but its ``trace`` attribute contains the
+        trace of the steps taken up to the point of failure.
+        """
+        with tracing._recording() as tracer:
+            try:
+                resolved = self._lookup(ref)
+            except Exception as error:
+                object.__setattr__(error, "_trace", tracer.trace())
+                raise
+        return tracing.Traced(resolved=resolved, trace=tracer.trace())
+
+    def _lookup(self, ref: URI) -> Resolved[D]:
         if ref.startswith("#"):
             uri, fragment = self._base_uri, ref[1:]
+            normalized = self._base_uri + ref
         else:
-            uri, fragment = urldefrag(urljoin(self._base_uri, ref))
+            normalized = urljoin(self._base_uri, ref)
+            uri, fragment = urldefrag(normalized)
+        tracing.record(
+            tracing.Action.JOIN,
+            uri=ref,
+            normalized_uri=normalized,
+        )
         try:
             retrieved = self._registry.get_or_retrieve(uri)
         except exceptions.NoSuchResource:
@@ -685,7 +761,21 @@ class Resolver(Generic[D]):
             return retrieved.value.pointer(pointer=fragment, resolver=resolver)
 
         if fragment:
-            retrieved = retrieved.registry.anchor(uri, fragment)
+            try:
+                retrieved = retrieved.registry.anchor(uri, fragment)
+            except exceptions.Unresolvable:
+                tracing.record(
+                    tracing.Action.ANCHOR,
+                    uri=uri,
+                    normalized_uri=f"{uri}#{fragment}",
+                )
+                raise
+            tracing.record(
+                tracing.Action.ANCHOR,
+                uri=uri,
+                normalized_uri=f"{uri}#{fragment}",
+                hit=fragment,
+            )
             resolver = self._evolve(registry=retrieved.registry, base_uri=uri)
             return retrieved.value.resolve(resolver=resolver)
 
@@ -699,7 +789,14 @@ class Resolver(Generic[D]):
         id = subresource.id()
         if id is None:
             return self
-        return evolve(self, base_uri=urljoin(self._base_uri, id))
+        base_uri = urljoin(self._base_uri, id)
+        tracing.record(
+            tracing.Action.BASE_URI,
+            uri=self._base_uri,
+            normalized_uri=base_uri,
+            hit=id,
+        )
+        return evolve(self, base_uri=base_uri)
 
     def dynamic_scope(self) -> Iterable[tuple[URI, Registry[D]]]:
         """

@@ -2,6 +2,12 @@
 Changelog
 =========
 
+v0.38.0
+-------
+
+* Add an opt-in resolution tracing API: `referencing.Resolver.lookup_traced` returns the usual resolution result along with an immutable `referencing.tracing.Trace` of the steps taken (URI joining, registry hits, crawls, retrievals, JSON pointer segments, anchors and dynamic scope consultation).
+  Exceptions raised during traced lookups expose the steps taken up to the failure via their ``trace`` attribute.
+
 v0.37.0
 -------
 

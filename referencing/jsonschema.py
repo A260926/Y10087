@@ -7,7 +7,14 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence, Set
 from typing import Any
 
-from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing import (
+    Anchor,
+    Registry,
+    Resource,
+    Specification,
+    exceptions,
+    tracing,
+)
 from referencing._attrs import frozen
 from referencing._core import (
     _UNSET,  # type: ignore[reportPrivateUsage]
@@ -610,9 +617,20 @@ class DynamicAnchor:
             try:
                 anchor = registry.anchor(uri, self.name).value
             except exceptions.NoSuchAnchor:
+                tracing.record(
+                    tracing.Action.DYNAMIC_SCOPE,
+                    uri=uri,
+                    normalized_uri=f"{uri}#{self.name}",
+                )
                 continue
             if isinstance(anchor, DynamicAnchor):
                 last = anchor.resource
+                tracing.record(
+                    tracing.Action.DYNAMIC_SCOPE,
+                    uri=uri,
+                    normalized_uri=f"{uri}#{self.name}",
+                    hit=self.name,
+                )
         return _Resolved(
             contents=last.contents,
             resolver=resolver.in_subresource(last),

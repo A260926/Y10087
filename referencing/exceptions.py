@@ -12,6 +12,7 @@ from referencing._attrs import frozen
 
 if TYPE_CHECKING:
     from referencing import Resource
+    from referencing.tracing import Trace
     from referencing.typing import URI
 
 
@@ -101,6 +102,18 @@ class Unresolvable(Exception):
     """
 
     ref: URI
+
+    @property
+    def trace(self) -> Trace | None:
+        """
+        The trace of the resolution which led to this error, if any.
+
+        This is `None` unless the resolution which failed was a traced one
+        (see `referencing.Resolver.lookup_traced`), in which case it is a
+        `referencing.tracing.Trace` containing the steps taken up to the
+        point of failure.
+        """
+        return getattr(self, "_trace", None)
 
     def __eq__(self, other: object) -> bool:
         if self.__class__ is not other.__class__:
